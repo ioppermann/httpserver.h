@@ -1,0 +1,50 @@
+#!/usr/bin/env sh
+
+sleep 1
+
+echo "Small Response Body:"
+curl --unix-socket ./server.sock http://localhost/
+
+echo "\n\nEmpty Response:"
+curl --unix-socket ./server.sock http://localhost/empty
+
+echo "\n\nEcho Body:"
+curl --unix-socket ./server.sock -XPOST http://localhost/echo -d'Echo test'
+
+echo "\n\nGet Header:"
+curl --unix-socket ./server.sock http://localhost/host
+
+echo "\n\nRequest Body larger than max in mem size:"
+dd if=/dev/urandom of=test.dat bs=25165824 count=1 2> /dev/null
+curl --unix-socket ./server.sock -H'Expect:' --data-binary @test.dat -o r1.dat http://localhost/large
+diff r1.dat test.dat
+
+echo "\n\nChunked Response:"
+curl --unix-socket ./server.sock http://localhost/chunked
+
+echo "\n\nChunked Response keep-alive:"
+curl --unix-socket ./server.sock http://localhost/chunked http://localhost/chunked
+
+echo "\n\nChunked Response close:"
+curl --unix-socket ./server.sock -H'Connection: close' http://localhost/chunked http://localhost/chunked
+
+echo "\n\nChunked Request keep-alive: (expect empty)"
+dd if=/dev/urandom of=test.dat bs=262144 count=1 2> /dev/null
+curl --unix-socket ./server.sock -H'Expect:' -H'Transfer-Encoding: chunked' -XPOST --data-binary @test.dat -o r1.dat http://localhost/chunked-req -o r2.dat http://localhost/chunked-req
+diff r1.dat test.dat
+diff r2.dat test.dat
+
+echo "\n\nChunked Request close: (expect empty)"
+curl --unix-socket ./server.sock -H'Expect:' -H'Transfer-Encoding: chunked' -XPOST --data-binary @test.dat -o r3.dat http://localhost/chunked-req -o r4.dat http://localhost/chunked-req
+diff r3.dat test.dat
+diff r4.dat test.dat
+
+echo "\n\nPoll Server:"
+curl --unix-socket ./poll_server.sock http://localhost/ &
+sleep 1
+curl --unix-socket ./server.sock http://localhost/poll
+sleep 1
+curl --unix-socket ./server.sock http://localhost/poll
+
+echo "\n\nIterate Headers:"
+curl --unix-socket ./server.sock -H'User-Agent: test-ua' -H'Foo-Header: foo-bar' http://localhost/headers

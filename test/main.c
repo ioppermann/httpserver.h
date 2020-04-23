@@ -113,8 +113,14 @@ void handle_sigterm(int signum) {
 
 int main() {
   signal(SIGTERM, handle_sigterm);
-  server = http_server_init(8080, handle_request);
-  poll_server = http_server_init(8081, handle_request);
-  http_server_listen_poll(poll_server);
-  http_server_listen(server);
+  server = http_server_init(handle_request);
+  poll_server = http_server_init(handle_request);
+
+#ifndef TEST_UNIX
+  http_server_listen_inet_poll(poll_server, NULL, 8081);
+  http_server_listen_inet(server, NULL, 8080);
+#else
+  http_server_listen_unix_poll(poll_server, "./poll_server.sock");
+  http_server_listen_unix(server, "./server.sock");
+#endif
 }

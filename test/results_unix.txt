@@ -1,0 +1,38 @@
+Small Response Body:
+Hello, World!
+
+Empty Response:
+
+
+Echo Body:
+Echo test
+
+Get Header:
+localhost
+
+Request Body larger than max in mem size:
+
+
+Chunked Response:
+Hello, World!Hello, World!Hello, World!
+
+Chunked Response keep-alive:
+Hello, World!Hello, World!Hello, World!Hello, World!Hello, World!Hello, World!
+
+Chunked Response close:
+Hello, World!Hello, World!Hello, World!Hello, World!Hello, World!Hello, World!
+
+Chunked Request keep-alive: (expect empty)
+
+
+Chunked Request close: (expect empty)
+
+
+Poll Server:
+Hello, World!Hello, World!Hello, World!
+
+Iterate Headers:
+Host: localhost
+Accept: */*
+User-Agent: test-ua
+Foo-Header: foo-bar

@@ -127,7 +127,7 @@ int http_server_loop(struct http_server_s* server);
 
 // Allocates and initializes the http server. Takes a port and a function
 // pointer that is called to process requests.
-struct http_server_s* http_server_init(int port, void (*handler)(struct http_request_s*));
+struct http_server_s* http_server_init(void (*handler)(struct http_request_s*));
 
 // Stores a pointer for future retrieval. This is not used by the library in
 // any way and is strictly for you, the application programmer to make use
@@ -138,8 +138,8 @@ void http_server_set_userdata(struct http_server_s* server, void* data);
 // function will not return. Return value is the error code if the server fails
 // to start. By default it will listen on all interface. For the second variant
 // provide the IP address of the interface to listen on, or NULL for any.
-int http_server_listen(struct http_server_s* server);
-int http_server_listen_addr(struct http_server_s* server, const char* ipaddr);
+int http_server_listen_inet(struct http_server_s* server, const char* ipaddr, int port);
+int http_server_listen_unix(struct http_server_s* server, const char* path);
 
 // Use this listen call in place of the one above when you want to integrate
 // an http server into an existing application that has a loop already and you
@@ -147,8 +147,8 @@ int http_server_listen_addr(struct http_server_s* server, const char* ipaddr);
 // applications like games that have a constant update loop. By default it will
 // listen on all interface. For the second variant provide the IP address of
 // the interface to listen on, or NULL for any.
-int http_server_listen_poll(struct http_server_s* server);
-int http_server_listen_addr_poll(struct http_server_s* server, const char* ipaddr);
+int http_server_listen_inet_poll(struct http_server_s* server, const char* ipaddr, int port);
+int http_server_listen_unix_poll(struct http_server_s* server, const char* path);
 
 // Call this function in your update loop. It will trigger the request handler
 // once if there is a request ready. Returns 1 if a request was handled and 0
@@ -297,8 +297,8 @@ void handle_request(struct http_request_s* request) {
 }
 
 int main() {
-  struct http_server_s* server = http_server_init(8080, handle_request);
-  http_server_listen(server);
+  struct http_server_s* server = http_server_init(handle_request);
+  http_server_listen_inet(server, NULL, 8080);
 }
 
 #endif
@@ -330,6 +330,7 @@ int main() {
 #include <assert.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 
 #ifdef KQUEUE
 #include <sys/event.h>
@@ -460,9 +461,7 @@ typedef struct http_server_s {
   int port;
   int loop;
   int timerfd;
-  socklen_t len;
   void (*request_handler)(http_request_t*);
-  struct sockaddr_in addr;
   void* data;
   char date[32];
 } http_server_t;
@@ -521,6 +520,7 @@ enum hs_meta_type {
 
 void hs_add_server_sock_events(struct http_server_s* serv);
 void hs_server_init(struct http_server_s* serv);
+void hs_server_listen(http_server_t* serv);
 void hs_delete_events(struct http_request_s* request);
 void hs_add_events(struct http_request_s* request);
 void hs_add_write_event(struct http_request_s* request);
@@ -1010,15 +1010,27 @@ void http_token_dyn_init(http_token_dyn_t* dyn, int capacity) {
   dyn->capacity = capacity;
 }
 
-void hs_bind_localhost(int s, struct sockaddr_in* addr, const char* ipaddr, int port) {
-  addr->sin_family = AF_INET;
+void hs_bind_inet(int s, const char* ipaddr, int port) {
+  struct sockaddr_in addr;
+  addr.sin_family = AF_INET;
   if (ipaddr == NULL) {
-    addr->sin_addr.s_addr = INADDR_ANY;
+    addr.sin_addr.s_addr = INADDR_ANY;
   } else {
-    addr->sin_addr.s_addr = inet_addr(ipaddr);
+    addr.sin_addr.s_addr = inet_addr(ipaddr);
   }
-  addr->sin_port = htons(port);
-  int rc = bind(s, (struct sockaddr *)addr, sizeof(struct sockaddr_in));
+  addr.sin_port = htons(port);
+  int rc = bind(s, (struct sockaddr *)&addr, sizeof(addr));
+  if (rc < 0) {
+    exit(1);
+  }
+}
+
+void hs_bind_unix(int s, const char* path) {
+  struct sockaddr_un addr;
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+  unlink(path);
+  int rc = bind(s, (struct sockaddr *)&addr, sizeof(addr));
   if (rc < 0) {
     exit(1);
   }
@@ -1173,7 +1185,8 @@ void http_session(http_request_t* request) {
 void hs_accept_connections(http_server_t* server) {
   int sock = 0;
   do {
-    sock = accept(server->socket, (struct sockaddr *)&server->addr, &server->len);
+    //sock = accept(server->socket, (struct sockaddr *)&server->addr, &server->len);
+    sock = accept(server->socket, NULL, NULL);
     if (sock > 0) {
       http_request_t* session = (http_request_t*)calloc(1, sizeof(http_request_t));
       assert(session != NULL);
@@ -1197,10 +1210,9 @@ void hs_generate_date_time(char* datetime) {
   strftime(datetime, 32, "%a, %d %b %Y %T GMT", timeinfo);
 }
 
-http_server_t* http_server_init(int port, void (*handler)(http_request_t*)) {
+http_server_t* http_server_init(void (*handler)(http_request_t*)) {
   http_server_t* serv = (http_server_t*)malloc(sizeof(http_server_t));
   assert(serv != NULL);
-  serv->port = port;
   serv->memused = 0;
   serv->handler = hs_server_listen_cb;
   hs_server_init(serv);
@@ -1213,27 +1225,51 @@ void http_server_set_userdata(struct http_server_s* serv, void* data) {
   serv->data = data;
 }
 
-void http_listen(http_server_t* serv, const char* ipaddr) {
+void http_listen_inet(http_server_t* serv, const char* ipaddr, int port) {
   // Ignore SIGPIPE. We handle these errors at the call site.
   signal(SIGPIPE, SIG_IGN);
+  serv->port = port;
   serv->socket = socket(AF_INET, SOCK_STREAM, 0);
   int flag = 1;
   setsockopt(serv->socket, SOL_SOCKET, SO_REUSEPORT, &flag, sizeof(flag));
-  hs_bind_localhost(serv->socket, &serv->addr, ipaddr, serv->port);
-  serv->len = sizeof(serv->addr);
+  hs_bind_inet(serv->socket, ipaddr, serv->port);
   int flags = fcntl(serv->socket, F_GETFL, 0);
   fcntl(serv->socket, F_SETFL, flags | O_NONBLOCK);
   listen(serv->socket, 128);
   hs_add_server_sock_events(serv);
 }
 
-int http_server_listen_addr_poll(http_server_t* serv, const char* ipaddr) {
-  http_listen(serv, ipaddr);
+int http_server_listen_inet(http_server_t* serv, const char* ipaddr, int port) {
+  http_listen_inet(serv, ipaddr, port);
+  hs_server_listen(serv);
   return 0;
 }
 
-int http_server_listen_poll(http_server_t* serv) {
-  return http_server_listen_addr_poll(serv, NULL);
+int http_server_listen_inet_poll(http_server_t* serv, const char* ipaddr, int port) {
+  http_listen_inet(serv, ipaddr, port);
+  return 0;
+}
+
+void http_listen_unix(http_server_t* serv, const char* path) {
+  // Ignore SIGPIPE. We handle these errors at the call site.
+  signal(SIGPIPE, SIG_IGN);
+  serv->socket = socket(AF_UNIX, SOCK_STREAM, 0);
+  hs_bind_unix(serv->socket, path);
+  int flags = fcntl(serv->socket, F_GETFL, 0);
+  fcntl(serv->socket, F_SETFL, flags | O_NONBLOCK);
+  listen(serv->socket, 128);
+  hs_add_server_sock_events(serv);
+}
+
+int http_server_listen_unix(http_server_t* serv, const char* path) {
+  http_listen_unix(serv, path);
+  hs_server_listen(serv);
+  return 0;
+}
+
+int http_server_listen_unix_poll(http_server_t* serv, const char* path) {
+  http_listen_unix(serv, path);
+  return 0;
 }
 
 int http_server_loop(http_server_t* server) {
@@ -1590,11 +1626,8 @@ void hs_add_server_sock_events(http_server_t* serv) {
   kevent(serv->loop, &ev_set, 1, NULL, 0, NULL);
 }
 
-int http_server_listen_addr(http_server_t* serv, const char* ipaddr) {
-  http_listen(serv, ipaddr);
-
+void hs_server_listen(http_server_t* serv) {
   struct kevent ev_list[1];
-
   while (1) {
     int nev = kevent(serv->loop, NULL, 0, ev_list, 1, NULL);
     for (int i = 0; i < nev; i++) {
@@ -1602,11 +1635,6 @@ int http_server_listen_addr(http_server_t* serv, const char* ipaddr) {
       ev_cb->handler(&ev_list[i]);
     }
   }
-  return 0;
-}
-
-int http_server_listen(http_server_t* serv) {
-  return http_server_listen_addr(serv, NULL);
 }
 
 void hs_delete_events(http_request_t* request) {
@@ -1691,8 +1719,7 @@ void hs_server_init(http_server_t* serv) {
   serv->timerfd = tfd;
 }
 
-int http_server_listen_addr(http_server_t* serv, const char* ipaddr) {
-  http_listen(serv, ipaddr);
+void hs_server_listen(http_server_t* serv) {
   struct epoll_event ev_list[1];
   while (1) {
     int nev = epoll_wait(serv->loop, ev_list, 1, -1);
@@ -1701,11 +1728,6 @@ int http_server_listen_addr(http_server_t* serv, const char* ipaddr) {
       ev_cb->handler(&ev_list[i]);
     }
   }
-  return 0;
-}
-
-int http_server_listen(http_server_t* serv) {
-  return http_server_listen_addr(serv, NULL);
 }
 
 void hs_delete_events(http_request_t* request) {
